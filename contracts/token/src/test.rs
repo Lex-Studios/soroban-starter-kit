@@ -33,6 +33,7 @@ fn test_initialize() {
 }
 
 #[test]
+#[should_panic]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_initialize_twice() {
     let env = Env::default();

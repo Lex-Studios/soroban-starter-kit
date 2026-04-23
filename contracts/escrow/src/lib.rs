@@ -1,5 +1,10 @@
 #![no_std]
 
+mod admin;
+mod errors;
+mod events;
+mod storage;
+mod test;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
@@ -25,20 +30,16 @@ fn bump_instance(env: &Env) {
 #[contract]
 pub struct EscrowContract;
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Buyer,
-    Seller,
-    Arbiter,
-    TokenContract,
-    Amount,
-    Deadline,
-    State,
-    BuyerApproved,
-    SellerDelivered,
-}
+pub use errors::EscrowError;
+pub use storage::{DataKey, EscrowInfo, EscrowState};
 
+use soroban_sdk::{contract, contractimpl, Address, Env};
+
+use admin::transfer_token;
+use storage::DataKey::{Amount, Arbiter, Buyer, BuyerApproved, Deadline, Seller, SellerDelivered, State, TokenContract};
+
+#[contract]
+pub struct EscrowContract;
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EscrowState {
@@ -65,7 +66,6 @@ pub enum EscrowError {
 
 #[contractimpl]
 impl EscrowContract {
-    /// Initialize the escrow with parties and terms
     pub fn initialize(
         env: Env,
         buyer: Address,
@@ -75,9 +75,22 @@ impl EscrowContract {
         amount: i128,
         deadline_ledger: u32,
     ) -> Result<(), EscrowError> {
-        if env.storage().instance().has(&DataKey::State) {
+        if env.storage().instance().has(&State) {
             return Err(EscrowError::AlreadyInitialized);
         }
+        if deadline_ledger <= env.ledger().sequence() {
+            panic!("Deadline must be in the future");
+        }
+        env.storage().instance().set(&Buyer, &buyer);
+        env.storage().instance().set(&Seller, &seller);
+        env.storage().instance().set(&Arbiter, &arbiter);
+        env.storage().instance().set(&TokenContract, &token_contract);
+        env.storage().instance().set(&Amount, &amount);
+        env.storage().instance().set(&Deadline, &deadline_ledger);
+        env.storage().instance().set(&State, &EscrowState::Created);
+        env.storage().instance().set(&BuyerApproved, &false);
+        env.storage().instance().set(&SellerDelivered, &false);
+        events::escrow_created(&env, &buyer, &seller, amount);
 
         // Verify deadline is sufficiently in the future
         if deadline_ledger < env.ledger().sequence() + MIN_DEADLINE_BUFFER {
@@ -105,21 +118,15 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Buyer funds the escrow
     pub fn fund(env: Env) -> Result<(), EscrowError> {
-        let state: EscrowState = env.storage().instance()
-            .get(&DataKey::State)
-            .ok_or(EscrowError::NotInitialized)?;
-
-        if state != EscrowState::Created {
-            return Err(EscrowError::InvalidState);
-        }
-
-        let buyer: Address = env.storage().instance().get(&DataKey::Buyer).unwrap();
-        let token_contract: Address = env.storage().instance().get(&DataKey::TokenContract).unwrap();
-        let amount: i128 = env.storage().instance().get(&DataKey::Amount).unwrap();
-
+        let state: EscrowState = env.storage().instance().get(&State).ok_or(EscrowError::NotInitialized)?;
+        if state != EscrowState::Created { return Err(EscrowError::InvalidState); }
+        let buyer: Address = env.storage().instance().get(&Buyer).unwrap();
+        let amount: i128 = env.storage().instance().get(&Amount).unwrap();
         buyer.require_auth();
+        transfer_token(&env, &buyer, &env.current_contract_address(), amount);
+        env.storage().instance().set(&State, &EscrowState::Funded);
+        events::escrow_funded(&env, &buyer, amount);
 
         // Transfer tokens from buyer to contract
         let token_client = token::Client::new(&env, &token_contract);
@@ -135,18 +142,14 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Seller marks delivery as complete
     pub fn mark_delivered(env: Env) -> Result<(), EscrowError> {
-        let state: EscrowState = env.storage().instance()
-            .get(&DataKey::State)
-            .ok_or(EscrowError::NotInitialized)?;
-
-        if state != EscrowState::Funded {
-            return Err(EscrowError::InvalidState);
-        }
-
-        let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
+        let state: EscrowState = env.storage().instance().get(&State).ok_or(EscrowError::NotInitialized)?;
+        if state != EscrowState::Funded { return Err(EscrowError::InvalidState); }
+        let seller: Address = env.storage().instance().get(&Seller).unwrap();
         seller.require_auth();
+        env.storage().instance().set(&SellerDelivered, &true);
+        env.storage().instance().set(&State, &EscrowState::Delivered);
+        events::delivery_marked(&env, &seller);
 
         // Mark as delivered
         env.storage().instance().set(&DataKey::SellerDelivered, &true);
@@ -159,81 +162,49 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Buyer approves delivery and releases funds
     pub fn approve_delivery(env: Env) -> Result<(), EscrowError> {
-        let state: EscrowState = env.storage().instance()
-            .get(&DataKey::State)
-            .ok_or(EscrowError::NotInitialized)?;
-
-        if state != EscrowState::Delivered {
-            return Err(EscrowError::InvalidState);
-        }
-
-        let buyer: Address = env.storage().instance().get(&DataKey::Buyer).unwrap();
+        let state: EscrowState = env.storage().instance().get(&State).ok_or(EscrowError::NotInitialized)?;
+        if state != EscrowState::Delivered { return Err(EscrowError::InvalidState); }
+        let buyer: Address = env.storage().instance().get(&Buyer).unwrap();
         buyer.require_auth();
-
-        // Release funds to seller
-        Self::release_to_seller(env)?;
-
-        Ok(())
+        Self::release_to_seller(env)
     }
 
-    /// Buyer requests refund (only before delivery or after deadline)
     pub fn request_refund(env: Env) -> Result<(), EscrowError> {
-        let state: EscrowState = env.storage().instance()
-            .get(&DataKey::State)
-            .ok_or(EscrowError::NotInitialized)?;
-
-        let buyer: Address = env.storage().instance().get(&DataKey::Buyer).unwrap();
-        let deadline: u32 = env.storage().instance().get(&DataKey::Deadline).unwrap();
-
+        let state: EscrowState = env.storage().instance().get(&State).ok_or(EscrowError::NotInitialized)?;
+        let buyer: Address = env.storage().instance().get(&Buyer).unwrap();
+        let deadline: u32 = env.storage().instance().get(&Deadline).unwrap();
         buyer.require_auth();
-
-        // Check conditions for refund
-        let can_refund = match state {
-            EscrowState::Funded => {
-                // Can refund if deadline passed and seller hasn't delivered
-                env.ledger().sequence() > deadline
-            }
-            EscrowState::Delivered => {
-                // Can refund if deadline passed and buyer hasn't approved
-                env.ledger().sequence() > deadline
-            }
-            _ => false,
-        };
-
-        if !can_refund {
-            return Err(EscrowError::DeadlineNotReached);
-        }
-
-        // Process refund
-        Self::refund_to_buyer(env)?;
-
-        Ok(())
+        let can_refund = matches!(state, EscrowState::Funded | EscrowState::Delivered)
+            && env.ledger().sequence() > deadline;
+        if !can_refund { return Err(EscrowError::DeadlineNotReached); }
+        Self::refund_to_buyer(env)
     }
 
-    /// Arbiter resolves dispute (can release to either party)
     pub fn resolve_dispute(env: Env, release_to_seller: bool) -> Result<(), EscrowError> {
-        let state: EscrowState = env.storage().instance()
-            .get(&DataKey::State)
-            .ok_or(EscrowError::NotInitialized)?;
-
+        let state: EscrowState = env.storage().instance().get(&State).ok_or(EscrowError::NotInitialized)?;
         if !matches!(state, EscrowState::Funded | EscrowState::Delivered) {
             return Err(EscrowError::InvalidState);
         }
-
-        let arbiter: Address = env.storage().instance().get(&DataKey::Arbiter).unwrap();
+        let arbiter: Address = env.storage().instance().get(&Arbiter).unwrap();
         arbiter.require_auth();
-
-        if release_to_seller {
-            Self::release_to_seller(env)?;
-        } else {
-            Self::refund_to_buyer(env)?;
-        }
-
-        Ok(())
+        if release_to_seller { Self::release_to_seller(env) } else { Self::refund_to_buyer(env) }
     }
 
+    pub fn get_escrow_info(env: Env) -> EscrowInfo {
+        EscrowInfo {
+            buyer: env.storage().instance().get(&Buyer).unwrap(),
+            seller: env.storage().instance().get(&Seller).unwrap(),
+            arbiter: env.storage().instance().get(&Arbiter).unwrap(),
+            token_contract: env.storage().instance().get(&TokenContract).unwrap(),
+            amount: env.storage().instance().get(&Amount).unwrap(),
+            deadline: env.storage().instance().get(&Deadline).unwrap(),
+            state: env.storage().instance().get(&State).unwrap(),
+        }
+    }
+
+    pub fn get_state(env: Env) -> EscrowState {
+        env.storage().instance().get(&State).unwrap_or(EscrowState::Created)
     /// Buyer partially releases funds to seller, reducing the stored amount
     pub fn release_partial(env: Env, amount: i128) -> Result<(), EscrowError> {
         let state: EscrowState = env.storage().instance()
@@ -303,14 +274,19 @@ impl EscrowContract {
         env.storage().instance().get(&DataKey::State)
     }
 
-    /// Check if deadline has passed
     pub fn is_deadline_passed(env: Env) -> bool {
-        let deadline: u32 = env.storage().instance()
-            .get(&DataKey::Deadline)
-            .unwrap_or(0);
+        let deadline: u32 = env.storage().instance().get(&Deadline).unwrap_or(0);
         env.ledger().sequence() > deadline
     }
+}
 
+impl EscrowContract {
+    fn release_to_seller(env: Env) -> Result<(), EscrowError> {
+        let seller: Address = env.storage().instance().get(&Seller).unwrap();
+        let amount: i128 = env.storage().instance().get(&Amount).unwrap();
+        transfer_token(&env, &env.current_contract_address(), &seller, amount);
+        env.storage().instance().set(&State, &EscrowState::Completed);
+        events::funds_released(&env, &seller, amount);
     /// Extend storage TTL for an active escrow. Anyone can call this.
     pub fn bump(env: Env) {
         if !env.storage().instance().has(&DataKey::State) {
@@ -340,6 +316,11 @@ impl EscrowContract {
     }
 
     fn refund_to_buyer(env: Env) -> Result<(), EscrowError> {
+        let buyer: Address = env.storage().instance().get(&Buyer).unwrap();
+        let amount: i128 = env.storage().instance().get(&Amount).unwrap();
+        transfer_token(&env, &env.current_contract_address(), &buyer, amount);
+        env.storage().instance().set(&State, &EscrowState::Refunded);
+        events::funds_refunded(&env, &buyer, amount);
         let buyer: Address = env.storage().instance().get(&DataKey::Buyer).unwrap();
         let token_contract: Address = env.storage().instance().get(&DataKey::TokenContract).unwrap();
         let amount: i128 = env.storage().instance().get(&DataKey::Amount).unwrap();
@@ -358,5 +339,3 @@ impl EscrowContract {
         Ok(())
     }
 }
-
-mod test;
