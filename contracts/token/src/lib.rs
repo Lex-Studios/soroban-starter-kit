@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, String, Symbol,
+    contract, contractimpl, contracttype, contracterror, panic_with_error, token, Address, Env, String, Symbol,
 };
 
 /// Token contract implementing the Soroban Token Interface
@@ -39,7 +39,8 @@ pub enum MetadataKey {
 }
 
 /// Custom errors for the token contract
-#[contracttype]
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum TokenError {
     InsufficientBalance = 1,
     InsufficientAllowance = 2,
@@ -228,7 +229,9 @@ impl token::Interface for TokenContract {
 
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
-        Self::transfer_impl(env, from, to, amount).unwrap();
+        if let Err(e) = Self::transfer_impl(env.clone(), from, to, amount) {
+            panic_with_error!(&env, e);
+        }
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
@@ -248,7 +251,9 @@ impl token::Interface for TokenContract {
         env.storage().temporary().set(&key, &(allowance - amount));
 
         // Perform transfer
-        Self::transfer_impl(env, from, to, amount).unwrap();
+        if let Err(e) = Self::transfer_impl(env.clone(), from, to, amount) {
+            panic_with_error!(&env, e);
+        }
     }
 }
 
