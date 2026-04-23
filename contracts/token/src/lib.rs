@@ -46,6 +46,7 @@ pub enum TokenError {
     Unauthorized = 3,
     AlreadyInitialized = 4,
     NotInitialized = 5,
+    InvalidAmount = 6,
 }
 
 #[contractimpl]
@@ -90,7 +91,7 @@ impl TokenContract {
         admin.require_auth();
 
         if amount < 0 {
-            panic!("Amount must be non-negative");
+            return Err(TokenError::InvalidAmount);
         }
 
         // Update recipient balance
@@ -119,7 +120,7 @@ impl TokenContract {
         admin.require_auth();
 
         if amount < 0 {
-            panic!("Amount must be non-negative");
+            return Err(TokenError::InvalidAmount);
         }
 
         let balance = Self::balance_of(env.clone(), from.clone());
@@ -261,7 +262,7 @@ impl TokenContract {
 
     fn transfer_impl(env: Env, from: Address, to: Address, amount: i128) -> Result<(), TokenError> {
         if amount < 0 {
-            panic!("Amount must be non-negative");
+            return Err(TokenError::InvalidAmount);
         }
 
         let from_balance = Self::balance_of(env.clone(), from.clone());
