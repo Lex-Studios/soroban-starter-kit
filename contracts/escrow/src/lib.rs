@@ -3,6 +3,17 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Env, Symbol,
 };
+
+/// Minimum TTL before a bump is needed (~7 days at 5s/ledger).
+const BUMP_THRESHOLD: u32 = 120_960;
+/// TTL extended to on every write (~30 days at 5s/ledger).
+const BUMP_AMOUNT: u32 = 518_400;
+/// Minimum ledgers from now a deadline must be set to (~8 minutes at 5s/ledger).
+const MIN_DEADLINE_BUFFER: u32 = 100;
+
+fn bump_instance(env: &Env) {
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+}
  /// script
 /// Escrow contract for secure two-party transactions
 /// 
@@ -67,9 +78,9 @@ impl EscrowContract {
             return Err(EscrowError::AlreadyInitialized);
         }
 
-        // Verify deadline is in the future
-        if deadline_ledger <= env.ledger().sequence() {
-            panic!("Deadline must be in the future");
+        // Verify deadline is sufficiently in the future
+        if deadline_ledger < env.ledger().sequence() + MIN_DEADLINE_BUFFER {
+            panic!("Deadline must be at least MIN_DEADLINE_BUFFER ledgers in the future");
         }
 
         // Store escrow details
@@ -82,6 +93,7 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::State, &EscrowState::Created);
         env.storage().instance().set(&DataKey::BuyerApproved, &false);
         env.storage().instance().set(&DataKey::SellerDelivered, &false);
+        bump_instance(&env);
 
         // Emit event
         env.events().publish(
@@ -114,6 +126,7 @@ impl EscrowContract {
 
         // Update state
         env.storage().instance().set(&DataKey::State, &EscrowState::Funded);
+        bump_instance(&env);
 
         // Emit event
         env.events().publish((Symbol::new(&env, "escrow_funded"), buyer), amount);
@@ -137,6 +150,7 @@ impl EscrowContract {
         // Mark as delivered
         env.storage().instance().set(&DataKey::SellerDelivered, &true);
         env.storage().instance().set(&DataKey::State, &EscrowState::Delivered);
+        bump_instance(&env);
 
         // Emit event
         env.events().publish((Symbol::new(&env, "delivery_marked"), seller), ());
@@ -247,6 +261,14 @@ impl EscrowContract {
         env.ledger().sequence() > deadline
     }
 
+    /// Extend storage TTL for an active escrow. Anyone can call this.
+    pub fn bump(env: Env) {
+        if !env.storage().instance().has(&DataKey::State) {
+            panic!("Not initialized");
+        }
+        bump_instance(&env);
+    }
+
     // Internal helper functions
     fn release_to_seller(env: Env) -> Result<(), EscrowError> {
         let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
@@ -259,6 +281,7 @@ impl EscrowContract {
 
         // Update state
         env.storage().instance().set(&DataKey::State, &EscrowState::Completed);
+        bump_instance(&env);
 
         // Emit event
         env.events().publish((Symbol::new(&env, "funds_released"), seller), amount);
@@ -277,6 +300,7 @@ impl EscrowContract {
 
         // Update state
         env.storage().instance().set(&DataKey::State, &EscrowState::Refunded);
+        bump_instance(&env);
 
         // Emit event
         env.events().publish((Symbol::new(&env, "funds_refunded"), buyer), amount);
